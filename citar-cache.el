@@ -11,6 +11,7 @@
 
 (eval-when-compile
   (require 'cl-lib))
+(require 'cl-lib)
 (require 'parsebib)
 (require 'citar-format)
 (require 'seq)
@@ -22,7 +23,13 @@
 
 (defvar citar-ellipsis)
 
-;;; Variables:
+;;; Variables and customisation:
+
+(defvar citar-parsing-functions nil
+  "Alist of filename regexps and associated parsing functions.
+Each function should take two arguments: the filename of the
+bibliography and a hash table to be populated with the parsed
+entries.")
 
 
 (defvar citar-cache--bibliographies (make-hash-table :test 'equal)
@@ -231,11 +238,17 @@ After updating, the `props' slot of BIB is set to PROPS."
   (let* ((filename (citar-cache--bibliography-filename bib))
          (props (or props (citar-cache--get-bibliography-props filename)))
          (messagestr (format "Updating bibliography %s" (abbreviate-file-name filename)))
-         (starttime (current-time)))
+         (starttime (current-time))
+         (parser (cdr (cl-assoc-if (lambda (regexp) (string-match-p regexp filename))
+                                citar-parsing-functions))))
     (message "%s..." messagestr)
     (redisplay)                         ; Make sure message is displayed before Emacs gets busy parsing
-    (setf (citar-cache--bibliography-entries bib) (parsebib-parse filename)
-          (citar-cache--bibliography-props bib) props)
+    (if parser
+        (let ((entries (citar-cache--bibliography-entries bib)))
+          (clrhash entries)
+          (funcall parser filename entries))
+      (setf (citar-cache--bibliography-entries bib) (parsebib-parse filename)))
+    (setf (citar-cache--bibliography-props bib) props)
     (citar-cache--preformat-bibliography bib)
     (message "%s...done (%.3f seconds)" messagestr (float-time (time-since starttime)))))
 
