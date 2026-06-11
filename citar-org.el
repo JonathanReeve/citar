@@ -29,6 +29,10 @@
 (require 'oc)
 (require 'oc-basic)
 (require 'oc-csl)
+(require 'ol-bibtex)
+(require 'sqlite)
+(require 'json)
+(require 'cl-lib)
 
 (declare-function org-open-at-point "org")
 ;; we need to account for the move of these functions to a different file
@@ -73,6 +77,142 @@ If nil, use `org-cite-supported-styles'."
 Each function takes one argument, a citation."
   :group 'citar-org
   :type '(repeat function))
+
+;;; Backend Functions
+
+(defun citar-org--get-entry-from-headline ()
+  "Parse a bibliographic entry from the current Org headline.
+Return an alist representing the entry, or nil if the headline
+is not a bibliographic entry."
+  (when (org-bibtex-get org-bibtex-type-property-name)
+    (let* ((key (org-bibtex-get org-bibtex-key-property))
+           (entry `(\,(cons "=key=" key))))
+      (dolist (field-info org-bibtex-fields)
+        (let* ((field (car field-info))
+               (field-name (substring (symbol-name field) 1))
+               (value (org-bibtex-get field-name)))
+          (when value
+            (push (cons field-name value) entry))))
+      ;; Add title from headline if not present as a property
+      (unless (assoc "title" entry)
+        (let ((title (nth 4 (org-heading-components))))
+          (when title
+            (push (cons "title" title) entry))))
+      ;; Add type
+      (let ((type (org-bibtex-get org-bibtex-type-property-name)))
+        (push (cons "=type=" type) entry))
+      (nreverse entry))))
+
+(defun citar-org-parse-file (filename entries)
+  "Parse bibliographic entries from an Org file FILENAME.
+Populate the ENTRIES hash table with the parsed entries."
+  (with-temp-buffer
+    (insert-file-contents filename)
+    (org-mode)
+    (org-map-entries
+     (lambda ()
+       (when-let ((entry (citar-org--get-entry-from-headline)))
+         (let ((key (cdr (assoc "=key=" entry))))
+           (when key
+             (puthash key entry entries))))))))
+
+(defun citar-org-parse-db (filename entries)
+  "Parse bibliographic entries from an Org-roam v2 database or Vulpea database FILENAME.
+Populate the ENTRIES hash table with the parsed entries."
+  (let ((db (sqlite-open filename)))
+    (condition-case err
+        (if (condition-case nil (sqlite-select db "SELECT 1 FROM notes LIMIT 1") (error nil))
+            ;; Vulpea database
+            (let ((rows (sqlite-select db "SELECT title, properties FROM notes WHERE properties IS NOT NULL")))
+              (dolist (row rows)
+                (let* ((title (let ((val (car row))) (if (stringp val) (read val) val)))
+                       (props-raw (cadr row))
+                       (props-str (if (stringp props-raw) (read props-raw) props-raw))
+                       (props (condition-case nil 
+                                   (json-parse-string props-str :object-type 'alist) 
+                                 (error nil)))
+                       (key (let ((refs (cl-loop for (k . v) in props
+                                                    for k-name = (symbol-name k)
+                                                    when (member (downcase k-name) '(\"references\" \"roam_refs\" \"custom_id\"))
+                                                    return v)))
+                              (cond
+                               ((not (stringp refs)) nil)
+                               ((string-match "cite:\\([^ ]+\\)" refs) (match-string 1 refs))
+                               ((string-match "@\\([^ ]+\\)" refs) (match-string 1 refs))
+                               (t refs)))))
+                  (when key
+                    (let ((entry (or (gethash key entries) (list (cons "=key=" key)))))
+                      (dolist (prop props)
+                        (let ((k-name (downcase (symbol-name (car prop))))
+                              (v (cdr prop)))
+                          (unless (member k-name '(\"references\" \"roam_refs\" \"custom_id\" \"id\"))
+                            (let ((val (if (stringp v) v (format \"%s\" v))))
+                              (unless (assoc k-name entry)
+                                (push (cons k-name val) entry))))))
+                      ;; Add title if not present
+                      (unless (or (assoc "title" entry) (assoc "TITLE" entry))
+                        (push (cons "title" title) entry))
+                      (puthash key entry entries))))))
+          ;; Org-roam v2 database
+          (let ((rows (sqlite-select db "SELECT properties FROM nodes WHERE properties IS NOT NULL")))
+            (dolist (row rows)
+              (let* ((props-str (car row))
+                     (props (car (read-from-string props-str)))
+                     (type (cl-loop for (k . v) in props
+                                    for k-str = (if (symbolp k) (substring (symbol-name k) (if (keywordp k) 1 0)) k)
+                                    when (member (downcase k-str) (list (downcase org-bibtex-type-property-name)
+                                                                        "type" "btype"))
+                                    return v))
+                     (key (or (cl-loop for (k . v) in props
+                                       for k-str = (if (symbolp k) (substring (symbol-name k) (if (keywordp k) 1 0)) k)
+                                       when (member (downcase k-str) (list (downcase org-bibtex-key-property)
+                                                                           "custom_id"))
+                                       return v)
+                              (let ((refs (cl-loop for (k . v) in props
+                                                   for k-str = (if (symbolp k) (substring (symbol-name k) (if (keywordp k) 1 0)) k)
+                                                   when (equal (downcase k-str) "roam_refs")
+                                                   return v)))
+                                (when (and (stringp refs) (string-match "cite:\\([^ ]+\\)" refs))
+                                  (match-string 1 refs))))))
+                (when key
+                  (let ((entry (citar-org--convert-roam-props-to-citar-entry props key)))
+                    (unless (assoc "=type=" entry)
+                      (push (cons "=type=" (or type "note")) entry))
+                    (puthash key entry entries)))))))
+      (error (message "Error parsing DB %s: %s" filename err)))
+    (sqlite-close db)))
+
+(defun citar-org--convert-roam-props-to-citar-entry (props key)
+  "Convert a list of roam properties PROPS to a Citar entry alist."
+  (let ((entry `(\,(cons "=key=" key))))
+    (dolist (prop props)
+      (let* ((prop-key (car prop))
+             (prop-val (cdr prop))
+             (prop-key-str (if (symbolp prop-key)
+                                (substring (symbol-name prop-key) (if (keywordp prop-key) 1 0))
+                              prop-key))
+             (citar-key (replace-regexp-in-string (concat "^" org-bibtex-prefix) "" prop-key-str)))
+        (cond
+         ((member (downcase citar-key) (list (downcase org-bibtex-type-property-name)
+                                              "type" "btype"))
+          (push (cons "=type=" prop-val) entry))
+         ((member (downcase citar-key) (list (downcase org-bibtex-key-property)
+                                              "custom_id"))
+          nil) ; already handled
+         (t
+          (push (cons citar-key prop-val) entry)))))
+    (nreverse entry)))
+
+;;;###autoload
+(defun citar-org-parse (filename &rest args)
+  "Parse bibliographic entries from FILENAME.
+This function is intended to be used as a parser in `citar-parsing-functions`.
+ARGS is a list of arguments, the first of which is the ENTRIES hash table."
+  (let ((entries (car args)))
+    (pcase (file-name-extension filename)
+      ("db" (citar-org-parse-db filename entries))
+      ("org" (citar-org-parse-file filename entries))
+      (_ (error "Unsupported file type for citar-org: %s" filename)))))
 
 ;;; Keymaps
 
